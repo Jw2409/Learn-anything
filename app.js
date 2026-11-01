@@ -177,17 +177,30 @@ async function callAI(prompt) {
   if (!s.apiKey) throw new Error('Add your Gemini API key in Settings first.');
   const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(s.model) + ':generateContent';
   let res;
-  try {
-    res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': s.apiKey },
-      body: JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        generationConfig: { responseMimeType: 'application/json', temperature: 0.7 }
-      })
-    });
-  } catch (e) {
-    throw new Error('Could not reach the AI. Check your internet connection.');
+  // Google's free models sometimes answer 503 ("busy"). That is shared
+  // capacity, not your key, so wait a moment and try again (up to 3 retries).
+  const waits = [2000, 5000, 10000];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': s.apiKey },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: 'application/json', temperature: 0.7 }
+        })
+      });
+    } catch (e) {
+      throw new Error('Could not reach the AI. Check your internet connection.');
+    }
+    if (res.status === 503 && attempt < waits.length) {
+      await new Promise(r => setTimeout(r, waits[attempt]));
+      continue;
+    }
+    break;
+  }
+  if (res.status === 503) {
+    throw new Error('Google\'s AI is busy right now. This is shared capacity, not a problem with your key. Wait a minute and try again, or change the model name in Settings to a lighter one such as gemini-2.5-flash-lite.');
   }
   if (!res.ok) {
     let detail = '';
