@@ -1,0 +1,13 @@
+{
+  "name": "Learn Anything",
+  "short_name": "Learn",
+  "description": "Learn any topic with scheduled lessons and real teaching methods.",
+  "start_url": ".",
+  "scope": ".",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#1b5fd1",
+  "icons": [
+    { "src": "icon.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}
