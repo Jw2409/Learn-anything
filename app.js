@@ -5,9 +5,9 @@
  *
  * Layout of this file:
  *   1. Settings, teaching-method list, saved data
- *   2. Small helpers (dates, text safety)
+ *   2. Small helpers (dates, text safety, streaks)
  *   3. Teaching logic: schedule + spaced repetition (plain code, no AI)
- *   4. AI: the ONE place that talks to the AI provider (callAI)
+ *   4. AI: the ONE place that talks to the AI provider (callAI) + prompts
  *   5. Screens (what you see)
  *   6. Buttons and events
  */
@@ -16,9 +16,10 @@
 /* ================= 1. Settings and saved data ================= */
 
 const STORE_KEY = 'learnanything.v1';
+const MAX_LESSONS = 40;
 
-// Every teaching method is a switch. "prompt" ones change what the AI is
-// asked to write; "code" ones change what the app itself does.
+// Every teaching method is a switch. Some change what the AI is asked to
+// write; others change what the app itself does.
 const METHOD_INFO = {
   preTest:        { label: 'Pre-test',            help: 'A few ungraded questions BEFORE the lesson to prime your brain.' },
   recall:         { label: 'Quiz after the lesson (active recall)', help: 'Testing yourself beats rereading.' },
@@ -27,7 +28,8 @@ const METHOD_INFO = {
   explainBack:    { label: 'Explain it back',     help: 'Write a short summary in your own words and get AI feedback.' },
   workedExamples: { label: 'Worked examples',     help: 'A full step-by-step example in each lesson.' },
   analogies:      { label: 'Analogies',           help: 'Ideas explained through everyday comparisons.' },
-  chunking:       { label: 'Chunking',            help: 'Short sections instead of long blocks of text.' }
+  chunking:       { label: 'Chunking',            help: 'Short pages instead of long blocks of text.' },
+  visuals:        { label: 'Visuals',             help: 'Simple diagrams in the lesson: step-by-step flows, side-by-side comparisons and timelines.' }
 };
 
 function defaultState() {
@@ -43,11 +45,13 @@ function defaultState() {
       allowAhead: false,
       methods: {
         preTest: false, recall: true, spaced: true, interleave: true,
-        explainBack: false, workedExamples: true, analogies: true, chunking: true
+        explainBack: false, workedExamples: true, analogies: true, chunking: true, visuals: true
       }
     },
     courses: [],
-    cards: []
+    cards: [],
+    bookmarks: [],
+    activity: []   // days (YYYY-MM-DD) when you learned something; drives your streak
   };
 }
 
@@ -62,7 +66,9 @@ function loadState() {
         methods: Object.assign({}, d.settings.methods, (p.settings && p.settings.methods) || {})
       }),
       courses: Array.isArray(p.courses) ? p.courses : [],
-      cards: Array.isArray(p.cards) ? p.cards : []
+      cards: Array.isArray(p.cards) ? p.cards : [],
+      bookmarks: Array.isArray(p.bookmarks) ? p.bookmarks : [],
+      activity: Array.isArray(p.activity) ? p.activity : []
     };
   } catch (e) {
     return defaultState();
@@ -73,13 +79,15 @@ let state = (typeof localStorage !== 'undefined') ? loadState() : defaultState()
 
 // What is on screen right now (not saved).
 const ui = {
-  view: 'home',      // home | new | course | lesson | review | settings
+  view: 'home',      // home | new | course | lesson | review | stats | settings
   courseId: null,
   session: null,     // the lesson in progress
   review: null,      // the review in progress
   message: null,     // {type:'error'|'ok', text}
   busy: null,        // text while waiting for the AI
+  log: [],           // live "what the AI is doing" lines
   draft: {},         // keeps the "new course" form filled in after an error
+  statOpen: {},      // which dropdowns on the Stats tab are open
   focus: null        // CSS selector to focus after drawing
 };
 
@@ -122,6 +130,39 @@ function niceDate(s) {
   return parseDay(s).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
+// Streak = how many days in a row you learned something. It stays alive
+// through today if you have not studied yet but did yesterday.
+function markActive(day) {
+  day = day || todayStr();
+  if (state.activity.indexOf(day) < 0) {
+    state.activity.push(day);
+    state.activity.sort();
+    if (state.activity.length > 1500) state.activity = state.activity.slice(-1500);
+  }
+}
+function currentStreak(activity, today) {
+  today = today || todayStr();
+  const set = new Set(activity);
+  let d = set.has(today) ? today : addDays(today, -1);
+  let n = 0;
+  while (set.has(d)) { n++; d = addDays(d, -1); }
+  return n;
+}
+
+// Score -> stars (0-5), color tone and a word (so color is never the only clue).
+function rating(pct) {
+  return {
+    stars: Math.round(pct / 20),
+    tone: pct >= 80 ? 'good' : pct >= 60 ? 'warn' : 'bad',
+    word: pct >= 80 ? 'Strong' : pct >= 60 ? 'Getting there' : 'Needs work'
+  };
+}
+function starsHtml(n, tone) {
+  let s = '';
+  for (let i = 0; i < 5; i++) s += i < n ? '★' : '☆';
+  return '<span class="stars ' + tone + '" role="img" aria-label="' + n + ' out of 5 stars">' + s + '</span>';
+}
+
 /* ================= 3. Teaching logic (no AI needed) ================= */
 
 const PERIOD_DAYS = { daily: 1, weekly: 7, monthly: 30 };
@@ -159,6 +200,26 @@ function pickInterleaved(cards, courseId, lessonIndex, n) {
   return pool.slice(0, n);
 }
 
+// A lesson is shown like a book: one "page" per section, plus pages for the
+// analogy, the worked example and the key takeaways.
+function buildPages(content) {
+  const pages = [];
+  content.sections.forEach(s => pages.push({ kind: 'text', heading: s.heading || 'Lesson', text: s.text, visual: s.visual || null }));
+  if (content.analogy) pages.push({ kind: 'analogy', heading: 'Think of it this way', text: content.analogy });
+  if (content.workedExample) pages.push({ kind: 'example', heading: 'Worked example', problem: content.workedExample.problem, steps: content.workedExample.steps });
+  if (content.keyTakeaways && content.keyTakeaways.length) pages.push({ kind: 'takeaways', heading: 'Key takeaways', points: content.keyTakeaways });
+  return pages;
+}
+function pageText(p) {
+  if (p.kind === 'example') return p.heading + '. ' + p.problem + ' ' + p.steps.join('. ');
+  if (p.kind === 'takeaways') return p.heading + '. ' + p.points.join('. ');
+  return p.heading + '. ' + p.text;
+}
+
+function hasBookmark(courseId, lessonIndex, page) {
+  return state.bookmarks.some(b => b.courseId === courseId && b.lessonIndex === lessonIndex && b.page === page);
+}
+
 /* ================= 4. The AI (swap providers here) ================= */
 
 function parseJSON(text) {
@@ -170,12 +231,42 @@ function parseJSON(text) {
   }
 }
 
-// To use a different AI later, only this function needs to change. It takes
-// a prompt and must return a JavaScript object parsed from JSON.
-async function callAI(prompt) {
+// While the AI writes, its JSON answer starts with a "log" list of what it is
+// working on. This pulls out the finished lines from the half-written text so
+// they can be shown live.
+function extractLog(text) {
+  const m = /"log"\s*:\s*\[/.exec(text);
+  if (!m) return [];
+  const rest = text.slice(m.index + m[0].length);
+  const out = [];
+  const re = /"((?:[^"\\]|\\.)*)"\s*(,|\])?/g;
+  let x;
+  while ((x = re.exec(rest))) {
+    try { out.push(String(JSON.parse('"' + x[1] + '"')).slice(0, 140)); } catch (e) { /* skip */ }
+    if (x[2] === ']') break;
+  }
+  return out.slice(0, 8);
+}
+
+// One line of the streaming answer ("data: {...}") -> the text inside it.
+function sseText(line) {
+  if (line.indexOf('data:') !== 0) return '';
+  const payload = line.slice(5).trim();
+  if (!payload || payload === '[DONE]') return '';
+  let o;
+  try { o = JSON.parse(payload); } catch (e) { return ''; }
+  if (o.error) throw new Error('AI error: ' + (o.error.message || 'unknown'));
+  const parts = o.candidates && o.candidates[0] && o.candidates[0].content && o.candidates[0].content.parts;
+  return parts ? parts.filter(p => !p.thought).map(p => p.text || '').join('') : '';
+}
+
+// To use a different AI later, only this function needs to change. It takes a
+// prompt, calls onText(textSoFar) while the answer streams in, and returns a
+// JavaScript object parsed from the AI's JSON answer.
+async function callAI(prompt, onText) {
   const s = state.settings;
   if (!s.apiKey) throw new Error('Add your Gemini API key in Settings first.');
-  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(s.model) + ':generateContent';
+  const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(s.model) + ':streamGenerateContent?alt=sse';
   let res;
   // Google's free models sometimes answer 503 ("busy"). That is shared
   // capacity, not your key, so wait a moment and try again (up to 3 retries).
@@ -210,23 +301,43 @@ async function callAI(prompt) {
     if (res.status === 404) throw new Error('That model name was not found. Change the model in Settings. ' + detail);
     throw new Error('AI error ' + res.status + '. ' + detail);
   }
-  const data = await res.json();
-  const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
-  const text = parts ? parts.map(p => p.text || '').join('') : '';
+  let text = '', buf = '';
+  if (res.body && res.body.getReader) {
+    const reader = res.body.getReader(), dec = new TextDecoder();
+    for (;;) {
+      let chunk;
+      try { chunk = await reader.read(); } catch (e) { throw new Error('The connection dropped while the AI was writing. Please try again.'); }
+      if (chunk.done) break;
+      buf += dec.decode(chunk.value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) { text += sseText(buf.slice(0, nl).trim()); buf = buf.slice(nl + 1); }
+      if (onText) onText(text);
+    }
+    text += sseText(buf.trim());
+  } else {
+    (await res.text()).split('\n').forEach(l => { text += sseText(l.trim()); });
+  }
+  if (onText) onText(text);
   if (!text) throw new Error('The AI returned an empty answer. Please try again.');
   return parseJSON(text);
 }
 
+const LOG_SHAPE = '"log": ["3 to 5 short status lines about what you are doing right now, in the style \'Compiling topic - <specific thing>\', \'Reviewing <specific thing>\' or \'Setting up <specific thing>\'"]';
+
 function buildOutlinePrompt(d) {
+  const mins = PERIOD_MINUTES[d.period];
+  const countRule = d.count
+    ? 'Create a course with exactly ' + d.count + ' lessons, one per ' + PERIOD_NAME[d.period] + ', each about ' + mins + ' minutes long.'
+    : 'Decide how many lessons this topic needs, from 3 to ' + MAX_LESSONS + ', based on how broad and deep the topic is and the learner level. One lesson is given per ' + PERIOD_NAME[d.period] + ' and each lesson is about ' + mins + ' minutes long. Do not pad a small topic and do not cram a big one. Give a one-sentence reason in "reason".';
   return [
     'You are an expert curriculum designer who uses evidence-based teaching.',
     'Topic the learner wants to learn: ' + d.topic,
     'Learner level: ' + d.level + '.',
     d.notes ? 'Learner notes and goals: ' + d.notes : '',
-    'Create a course with exactly ' + d.count + ' lessons, one per ' + PERIOD_NAME[d.period] + ', each about ' + PERIOD_MINUTES[d.period] + ' minutes long.',
+    countRule,
     'Order the lessons so each builds on the previous ones. Do not repeat content across lessons.',
-    'Return ONLY JSON in this shape:',
-    '{"title": "short course title", "lessons": [{"title": "lesson title", "summary": "one sentence on what this lesson covers"}]}'
+    'Return ONLY JSON in this shape. The first key must be "log":',
+    '{' + LOG_SHAPE + ', "title": "short course title", "reason": "why this many lessons", "lessons": [{"title": "lesson title", "summary": "one sentence on what this lesson covers"}]}'
   ].filter(Boolean).join('\n');
 }
 
@@ -236,12 +347,15 @@ function buildLessonPrompt(course, i, m) {
   const rules = [
     'Write for a ' + course.level + ' learner in plain, friendly language. No markdown symbols.',
     'Only state things you are confident are true. If something is uncertain or debated, say so.',
-    'The whole lesson should take about ' + PERIOD_MINUTES[course.period] + ' minutes.',
+    'The whole lesson should take about ' + PERIOD_MINUTES[course.period] + ' minutes to read, split across its pages.',
     m.chunking
-      ? 'Use 3 to 5 short sections, each at most about 120 words, with a clear heading.'
-      : 'Use 2 to 4 sections of moderate length, each with a clear heading.'
+      ? 'Use 4 to 7 short sections. Each section is one page of a book: a clear heading and at most about 120 words.'
+      : 'Use 3 to 5 sections. Each section is one page of a book: a clear heading and at most about 250 words.'
   ];
-  const shape = ['"title": "lesson title"', '"sections": [{"heading": "...", "text": "..."}]', '"keyTakeaways": ["3 to 5 short points"]'];
+  const shape = [LOG_SHAPE, '"title": "lesson title"', '"sections": [{"heading": "...", "text": "..."' + (m.visuals ? ', "visual": OPTIONAL' : '') + '}]', '"keyTakeaways": ["3 to 5 short points"]'];
+  if (m.visuals) {
+    rules.push('Add a simple diagram to 1 to 3 sections where a picture helps most (a process, a comparison, a sequence in time). Put it in that section\'s "visual" field and leave the field out of other sections. Use only these formats: {"type":"flow","title":"...","alt":"one sentence describing the diagram","steps":["...","..."]} or {"type":"compare","title":"...","alt":"...","columns":[{"heading":"...","points":["..."]}]} (2 or 3 columns) or {"type":"timeline","title":"...","alt":"...","events":[{"label":"...","text":"..."}]}. Keep every item short.');
+  }
   if (m.analogies) {
     rules.push('Include one memorable everyday analogy that explains the hardest idea.');
     shape.push('"analogy": "the analogy, 2 to 4 sentences"');
@@ -271,7 +385,7 @@ function buildLessonPrompt(course, i, m) {
     'Rules:',
     rules.map(r => '- ' + r).join('\n'),
     '',
-    'Return ONLY JSON in this shape:',
+    'Return ONLY JSON in this shape. The first key must be "log":',
     '{' + shape.join(', ') + '}'
   ].join('\n');
 }
@@ -287,6 +401,19 @@ function buildFeedbackPrompt(course, lesson, content, text) {
   ].join('\n');
 }
 
+function buildCoachPrompt(course, lesson) {
+  const r = lesson.result || { right: [], missed: [], score: 0 };
+  return [
+    'You are a supportive, honest teacher reviewing a learner\'s results.',
+    'Course: ' + course.title + '. Lesson: ' + lesson.title + '. Quiz score: ' + (lesson.score == null ? 'no quiz taken' : lesson.score + '%') + '.',
+    'Questions answered correctly: ' + (r.right.length ? r.right.join(' | ') : 'none'),
+    'Questions missed: ' + (r.missed.length ? r.missed.map(x => x.q + ' (they chose "' + x.yours + '", correct was "' + x.right + '")').join(' | ') : 'none'),
+    lesson.explainFeedback ? 'Feedback they got on their own summary: ' + lesson.explainFeedback : '',
+    'Write two short plain-text paragraphs. "didWell": what they clearly understand. "improve": the specific gaps and two concrete things to do next. No flattery.',
+    'Return ONLY JSON: {"didWell": "...", "improve": "..."}'
+  ].filter(Boolean).join('\n');
+}
+
 // Make sure a question from the AI is usable, and shuffle its options so the
 // right answer is not always in the same spot.
 function cleanQuestion(q) {
@@ -300,11 +427,28 @@ function cleanQuestion(q) {
   return { q: q.q, options: opts, correct: correct, explanation: String(q.explanation || '') };
 }
 
+// Check a diagram description from the AI. Anything odd is dropped, never shown.
+function cleanVisual(v) {
+  if (!v || typeof v !== 'object') return null;
+  const str = x => String(x == null ? '' : x).slice(0, 200);
+  const base = { title: str(v.title), alt: str(v.alt) };
+  if (v.type === 'flow' && Array.isArray(v.steps) && v.steps.length >= 2) {
+    return Object.assign(base, { type: 'flow', steps: v.steps.slice(0, 8).map(str) });
+  }
+  if (v.type === 'compare' && Array.isArray(v.columns) && v.columns.length >= 2) {
+    return Object.assign(base, { type: 'compare', columns: v.columns.slice(0, 3).map(c => ({ heading: str(c && c.heading), points: ((c && Array.isArray(c.points)) ? c.points : []).slice(0, 6).map(str) })) });
+  }
+  if (v.type === 'timeline' && Array.isArray(v.events) && v.events.length >= 2) {
+    return Object.assign(base, { type: 'timeline', events: v.events.slice(0, 8).map(e => ({ label: str(e && e.label), text: str(e && e.text) })) });
+  }
+  return null;
+}
+
 function cleanLesson(o) {
   if (!o || !Array.isArray(o.sections) || !o.sections.length) {
     throw new Error('The AI did not return a usable lesson. Please try again.');
   }
-  const sections = o.sections.filter(s => s && s.text).map(s => ({ heading: String(s.heading || ''), text: String(s.text) }));
+  const sections = o.sections.filter(s => s && s.text).map(s => ({ heading: String(s.heading || ''), text: String(s.text), visual: cleanVisual(s.visual) }));
   if (!sections.length) throw new Error('The AI did not return a usable lesson. Please try again.');
   return {
     sections: sections,
@@ -341,21 +485,25 @@ function render() {
   if (ui.message) {
     html += '<div class="msg ' + ui.message.type + '" role="' + (ui.message.type === 'error' ? 'alert' : 'status') + '">' + esc(ui.message.text) + '</div>';
   }
-  if (ui.busy) html += '<div class="busy" role="status">' + esc(ui.busy) + '</div>';
-  const titles = { home: 'Learn Anything', new: 'New course', course: 'Course', lesson: 'Lesson', review: 'Review', settings: 'Settings' };
-  let title = titles[ui.view] || 'Learn Anything';
+  if (ui.busy) {
+    html += '<div class="busy" role="status"><strong>' + esc(ui.busy) + '</strong><ul id="busy-log" class="plain" aria-hidden="true">' +
+      ui.log.map(l => '<li>' + esc(l) + '</li>').join('') + '</ul></div>';
+  }
+  const titles = { home: 'Learn Anything', new: 'New course', course: 'Course', lesson: 'Lesson', review: 'Review', stats: 'Stats', settings: 'Settings' };
+  const title = titles[ui.view] || 'Learn Anything';
   switch (ui.view) {
     case 'home': html += viewHome(); break;
     case 'new': html += viewNew(); break;
     case 'course': html += viewCourse(); break;
     case 'lesson': html += viewLesson(); break;
     case 'review': html += viewReview(); break;
+    case 'stats': html += viewStats(); break;
     case 'settings': html += viewSettings(); break;
   }
   main.innerHTML = html;
   document.getElementById('title').textContent = title;
   document.title = title === 'Learn Anything' ? title : title + ' - Learn Anything';
-  ['home', 'review', 'settings'].forEach(v => {
+  ['home', 'review', 'stats', 'settings'].forEach(v => {
     const b = document.getElementById('nav-' + v);
     if (!b) return;
     const active = (ui.view === v) || (v === 'home' && ['new', 'course', 'lesson'].indexOf(ui.view) >= 0);
@@ -383,6 +531,7 @@ function getCourse(id) { return state.courses.find(c => c.id === id); }
 
 function viewHome() {
   const due = dueCards(state.cards).length;
+  const streak = currentStreak(state.activity);
   let h = '';
   if (!state.courses.length) {
     h += '<section class="card"><h2>Welcome</h2>' +
@@ -394,6 +543,7 @@ function viewHome() {
     h += '<button class="btn" data-action="nav" data-view="review">Review (' + due + ' due)</button>';
   }
   h += '</div>';
+  if (streak > 0) h += '<p class="muted">Streak: <strong>' + streak + ' day' + (streak === 1 ? '' : 's') + '</strong> in a row</p>';
   state.courses.forEach(c => {
     const done = c.lessons.filter(l => l.completed).length;
     const pct = Math.round(100 * done / c.lessons.length);
@@ -402,7 +552,9 @@ function viewHome() {
     if (next < 0) nextHtml = '<p>Course complete. Well done!</p>';
     else {
       const st = lessonStatus(c, next, state.settings);
-      if (st === 'ready') nextHtml = '<button class="btn primary" data-action="startLesson" data-id="' + c.id + '" data-i="' + next + '">Start lesson ' + (next + 1) + ': ' + esc(c.lessons[next].title) + '</button>';
+      const l = c.lessons[next];
+      const verb = (l.content && l.lastPage > 0) ? 'Continue' : 'Start';
+      if (st === 'ready') nextHtml = '<button class="btn primary" data-action="startLesson" data-id="' + c.id + '" data-i="' + next + '">' + verb + ' lesson ' + (next + 1) + ': ' + esc(l.title) + '</button>';
       else nextHtml = '<p class="muted">Next lesson (' + (next + 1) + ') opens ' + esc(niceDate(lessonDate(c, next))) + '.</p>';
     }
     h += '<section class="card"><h2>' + esc(c.title) + '</h2>' +
@@ -410,11 +562,22 @@ function viewHome() {
       '<div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="' + pct + '" aria-label="Progress"><span style="width:' + pct + '%"></span></div>' +
       '<div class="row">' + nextHtml + '<button class="btn" data-action="openCourse" data-id="' + c.id + '">All lessons</button></div></section>';
   });
+  if (state.bookmarks.length) {
+    h += '<section class="card"><h2>Bookmarks</h2><ul class="plain">';
+    state.bookmarks.slice().reverse().slice(0, 12).forEach(b => {
+      const c = getCourse(b.courseId);
+      if (!c || !c.lessons[b.lessonIndex]) return;
+      h += '<li class="bm"><button class="btn" data-action="openBookmark" data-id="' + b.id + '">' + esc(c.title) + ', lesson ' + (b.lessonIndex + 1) + ': ' + esc(b.label) + '</button>' +
+        '<button class="btn danger" data-action="removeBookmark" data-id="' + b.id + '" aria-label="Remove bookmark ' + esc(b.label) + '">Remove</button></li>';
+    });
+    h += '</ul></section>';
+  }
   return h;
 }
 
 function viewNew() {
   const d = ui.draft;
+  const auto = d.auto !== false;
   function opt(v, label, cur) { return '<option value="' + v + '"' + (cur === v ? ' selected' : '') + '>' + label + '</option>'; }
   return '<form id="new-form" onsubmit="return false">' +
     '<label class="field" for="f-topic">What do you want to learn?</label>' +
@@ -423,8 +586,9 @@ function viewNew() {
     '<select id="f-level">' + opt('complete beginner', 'Complete beginner', d.level || 'complete beginner') + opt('some knowledge', 'Some knowledge', d.level) + opt('intermediate', 'Intermediate', d.level) + opt('advanced', 'Advanced', d.level) + '</select>' +
     '<label class="field" for="f-period">How often do you want a lesson?</label>' +
     '<select id="f-period">' + opt('daily', 'Every day (about 10 min)', d.period || 'daily') + opt('weekly', 'Every week (about 20 min)', d.period) + opt('monthly', 'Every month (about 30 min)', d.period) + '</select>' +
-    '<label class="field" for="f-count">How many lessons? (1 to 30)</label>' +
-    '<input type="number" id="f-count" min="1" max="30" value="' + esc(d.count || 7) + '" inputmode="numeric">' +
+    '<label class="check"><input type="checkbox" id="f-auto"' + (auto ? ' checked' : '') + '><span>Let the AI decide how many lessons<span class="help">It sizes the course to your topic and level. Untick to choose the number yourself.</span></span></label>' +
+    '<div id="count-wrap"' + (auto ? ' hidden' : '') + '><label class="field" for="f-count">Number of lessons (1 to ' + MAX_LESSONS + ')</label>' +
+    '<input type="number" id="f-count" min="1" max="' + MAX_LESSONS + '" value="' + esc(d.count || 7) + '" inputmode="numeric"></div>' +
     '<label class="field" for="f-notes">Anything else? (optional: your goals, what to focus on)</label>' +
     '<textarea id="f-notes">' + esc(d.notes || '') + '</textarea>' +
     '<div class="row"><button class="btn primary" data-action="createCourse"' + (ui.busy ? ' disabled' : '') + '>Create course</button>' +
@@ -434,17 +598,48 @@ function viewNew() {
 function viewCourse() {
   const c = getCourse(ui.courseId);
   if (!c) return '<p>Course not found.</p>';
-  let h = '<h2>' + esc(c.title) + '</h2><p class="muted">' + esc(c.level) + ' level. Started ' + esc(niceDate(c.start)) + '.</p><ol class="steps">';
+  let h = '<h2>' + esc(c.title) + '</h2><p class="muted">' + esc(c.level) + ' level. Started ' + esc(niceDate(c.start)) + '.</p>';
+  if (c.countReason) h += '<p class="muted">' + c.lessons.length + ' lessons: ' + esc(c.countReason) + '</p>';
+  h += '<ol class="steps">';
   c.lessons.forEach((l, i) => {
     const st = lessonStatus(c, i, state.settings);
     let status, btn = '';
-    if (st === 'done') { status = 'Done' + (typeof l.score === 'number' ? ' (quiz ' + l.score + '%)' : ''); btn = '<button class="btn" data-action="startLesson" data-id="' + c.id + '" data-i="' + i + '">Revisit</button>'; }
-    else if (st === 'ready') { status = 'Ready'; btn = '<button class="btn primary" data-action="startLesson" data-id="' + c.id + '" data-i="' + i + '">Start</button>'; }
-    else if (st === 'locked-date') status = 'Opens ' + niceDate(lessonDate(c, i));
+    const a = 'data-id="' + c.id + '" data-i="' + i + '"';
+    if (st === 'done') {
+      status = 'Done' + (typeof l.score === 'number' ? ' (quiz ' + l.score + '%)' : '');
+      btn = (l.content ? '<button class="btn" data-action="reread" ' + a + '>Read again</button>' : '') + '<button class="btn" data-action="startLesson" ' + a + '>Retake quiz</button>';
+    } else if (st === 'ready') {
+      status = 'Ready';
+      btn = '<button class="btn primary" data-action="startLesson" ' + a + '>' + (l.content && l.lastPage > 0 ? 'Continue' : 'Start') + '</button>';
+    } else if (st === 'locked-date') status = 'Opens ' + niceDate(lessonDate(c, i));
     else status = 'Finish the earlier lesson first';
     h += '<li><strong>' + esc(l.title) + '</strong> <span class="pill">' + esc(status) + '</span><br><span class="muted">' + esc(l.summary) + '</span><div class="row">' + btn + '</div></li>';
   });
   h += '</ol><div class="row"><button class="btn" data-action="nav" data-view="home">Back</button><button class="btn danger" data-action="deleteCourse" data-id="' + c.id + '">Delete course</button></div>';
+  return h;
+}
+
+// ----- diagrams (built from plain lists and tables so screen readers can read them) -----
+function renderVisual(v) {
+  if (!v) return '';
+  let body = '';
+  if (v.type === 'flow') {
+    body = '<ol class="flow">' + v.steps.map(s => '<li>' + esc(s) + '</li>').join('') + '</ol>';
+  } else if (v.type === 'compare') {
+    body = '<div class="cols">' + v.columns.map(c => '<section><h4>' + esc(c.heading) + '</h4><ul>' + c.points.map(p => '<li>' + esc(p) + '</li>').join('') + '</ul></section>').join('') + '</div>';
+  } else if (v.type === 'timeline') {
+    body = '<ol class="timeline">' + v.events.map(e => '<li><strong>' + esc(e.label) + '</strong> ' + esc(e.text) + '</li>').join('') + '</ol>';
+  }
+  return '<figure class="visual">' + (v.title ? '<figcaption>' + esc(v.title) + '</figcaption>' : '') +
+    (v.alt ? '<p class="sr-only">' + esc(v.alt) + '</p>' : '') + body + '</figure>';
+}
+
+function pageHtml(p) {
+  let h = '<h3 id="page-title" tabindex="-1">' + esc(p.heading) + '</h3>';
+  if (p.kind === 'text') h += paras(p.text) + renderVisual(p.visual);
+  else if (p.kind === 'analogy') h += '<section class="card">' + paras(p.text) + '</section>';
+  else if (p.kind === 'example') h += '<section class="card">' + paras(p.problem) + '<ol class="steps">' + p.steps.map(x => '<li>' + esc(x) + '</li>').join('') + '</ol></section>';
+  else if (p.kind === 'takeaways') h += '<ul>' + p.points.map(x => '<li>' + esc(x) + '</li>').join('') + '</ul>';
   return h;
 }
 
@@ -492,9 +687,9 @@ function viewLesson() {
   if (!S) return ui.busy ? '' : '<p>No lesson open.</p>';
   const c = getCourse(S.courseId), lesson = c.lessons[S.index], content = lesson.content;
   const step = S.steps[S.step];
-  const last = S.steps[S.steps.length - 1] === 'done';
   const total = S.steps.length - 1;
-  let h = '<p class="muted">' + esc(c.title) + ' - lesson ' + (S.index + 1) + ' of ' + c.lessons.length + (step !== 'done' ? ' - step ' + (S.step + 1) + ' of ' + total : '') + '</p>';
+  const reread = S.mode === 'reread';
+  let h = '<p class="muted">' + esc(c.title) + ' - lesson ' + (S.index + 1) + ' of ' + c.lessons.length + (step !== 'done' && !reread ? ' - step ' + (S.step + 1) + ' of ' + total : '') + (reread ? ' - reading again' : '') + '</p>';
   h += '<h2 id="step-title" tabindex="-1">' + esc(lesson.title) + '</h2>';
 
   if (step === 'pretest') {
@@ -504,25 +699,29 @@ function viewLesson() {
       (S.preAnswers ? '<button class="btn primary" data-action="next">Continue to the lesson</button>'
         : '<button class="btn primary" data-action="submitPre">Check my answers</button>') + '</div>';
   } else if (step === 'lesson') {
-    h += '<div class="row"><button class="btn" data-action="speak">Read aloud</button><button class="btn" data-action="stopSpeak">Stop reading</button></div>';
-    content.sections.forEach(s => {
-      h += (s.heading ? '<h3>' + esc(s.heading) + '</h3>' : '') + paras(s.text);
-    });
-    if (content.analogy) h += '<section class="card"><h3>Think of it this way</h3>' + paras(content.analogy) + '</section>';
-    if (content.workedExample) {
-      h += '<section class="card"><h3>Worked example</h3>' + paras(content.workedExample.problem) + '<ol class="steps">' +
-        content.workedExample.steps.map(x => '<li>' + esc(x) + '</li>').join('') + '</ol></section>';
-    }
-    if (content.keyTakeaways.length) h += '<h3>Key takeaways</h3><ul>' + content.keyTakeaways.map(x => '<li>' + esc(x) + '</li>').join('') + '</ul>';
-    const nextName = { quiz: 'Take the quiz', explain: 'Explain it back', done: 'Finish lesson' }[S.steps[S.step + 1]];
-    h += '<div class="row"><button class="btn primary" data-action="next">' + nextName + '</button>' +
-      '<button class="btn" data-action="regen">Regenerate lesson</button></div>';
+    const np = S.pages.length, p = S.pages[S.page];
+    const marked = hasBookmark(S.courseId, S.index, S.page);
+    const pct = Math.round(100 * (S.page + 1) / np);
+    h += '<div class="row"><button class="btn" data-action="bookmark" aria-pressed="' + marked + '">' + (marked ? '★ Bookmarked' : '☆ Bookmark this page') + '</button>' +
+      '<button class="btn" data-action="speak">Read aloud</button><button class="btn" data-action="stopSpeak">Stop</button></div>';
+    h += '<p class="muted" id="page-count">Page ' + (S.page + 1) + ' of ' + np + '</p>' +
+      '<div class="progress" aria-hidden="true"><span style="width:' + pct + '%"></span></div>';
+    h += '<label class="field" for="jump">Jump to page</label><select id="jump">' +
+      S.pages.map((x, k) => '<option value="' + k + '"' + (k === S.page ? ' selected' : '') + '>' + (k + 1) + '. ' + esc(x.heading) + (hasBookmark(S.courseId, S.index, k) ? ' ★' : '') + '</option>').join('') + '</select>';
+    h += '<article class="page">' + pageHtml(p) + '</article>';
+    const last = S.page === np - 1;
+    const nextName = { quiz: 'Take the quiz', explain: 'Explain it back', done: reread ? 'Finish reading' : 'Finish lesson' }[S.steps[S.step + 1]];
+    h += '<div class="row pager"><button class="btn" data-action="page" data-dir="-1"' + (S.page === 0 ? ' disabled' : '') + '>← Previous</button>' +
+      (last ? '<button class="btn primary" data-action="next">' + nextName + '</button>' : '<button class="btn primary" data-action="page" data-dir="1">Next page →</button>') + '</div>';
+    if (last) h += '<div class="row"><button class="btn" data-action="regen">Regenerate lesson</button></div>';
   } else if (step === 'quiz') {
     h += '<h3>Quiz</h3>';
     h += renderQuestions(S.quizItems, S.quizAnswers);
     if (S.quizAnswers) {
       const sc = scoreOf(S.quizItems, S.quizAnswers);
+      const mine = S.quizItems.filter(it => it.kind === 'new').length;
       h += '<div class="msg ok" id="result" tabindex="-1" role="status">You scored ' + sc + ' of ' + S.quizItems.length + '.' +
+        (mine !== S.quizItems.length && typeof lesson.score === 'number' ? ' This lesson\'s questions: ' + lesson.score + '%.' : '') +
         (state.settings.methods.spaced ? ' Questions you missed will come back sooner in Review.' : '') + '</div>';
       h += '<div class="row"><button class="btn primary" data-action="next">Continue</button></div>';
     } else {
@@ -536,15 +735,21 @@ function viewLesson() {
       (S.feedback ? '' : '<button class="btn primary" data-action="submitExplain"' + (ui.busy ? ' disabled' : '') + '>Get feedback</button>') +
       '<button class="btn ' + (S.feedback ? 'primary' : '') + '" data-action="next">' + (S.feedback ? 'Finish lesson' : 'Skip') + '</button></div>';
   } else if (step === 'done') {
-    const nxt = S.index + 1;
-    h += '<div class="msg ok" id="result" tabindex="-1" role="status">Lesson complete. Nice work!' +
-      (typeof lesson.score === 'number' ? ' Quiz score: ' + lesson.score + '%.' : '') + '</div>';
-    if (nxt < c.lessons.length) {
-      const st = lessonStatus(c, nxt, state.settings);
-      if (st === 'ready') h += '<p>The next lesson is ready.</p><div class="row"><button class="btn primary" data-action="startLesson" data-id="' + c.id + '" data-i="' + nxt + '">Start lesson ' + (nxt + 1) + '</button></div>';
-      else h += '<p>Next lesson opens <strong>' + esc(niceDate(lessonDate(c, nxt))) + '</strong>. Come back then.</p>';
-    } else h += '<p>That was the last lesson. Course complete!</p>';
-    h += '<div class="row"><button class="btn" data-action="nav" data-view="home">Home</button></div>';
+    if (reread) {
+      h += '<div class="msg ok" id="result" tabindex="-1" role="status">That is the end of the lesson.</div>' +
+        '<div class="row"><button class="btn primary" data-action="openCourse" data-id="' + c.id + '">Back to course</button>' +
+        '<button class="btn" data-action="startLesson" data-id="' + c.id + '" data-i="' + S.index + '">Retake lesson and quiz</button></div>';
+    } else {
+      const nxt = S.index + 1;
+      h += '<div class="msg ok" id="result" tabindex="-1" role="status">Lesson complete. Nice work!' +
+        (typeof lesson.score === 'number' ? ' Quiz score: ' + lesson.score + '%.' : '') + '</div>';
+      if (nxt < c.lessons.length) {
+        const st = lessonStatus(c, nxt, state.settings);
+        if (st === 'ready') h += '<p>The next lesson is ready.</p><div class="row"><button class="btn primary" data-action="startLesson" data-id="' + c.id + '" data-i="' + nxt + '">Start lesson ' + (nxt + 1) + '</button></div>';
+        else h += '<p>Next lesson opens <strong>' + esc(niceDate(lessonDate(c, nxt))) + '</strong>. Come back then.</p>';
+      } else h += '<p>That was the last lesson. Course complete!</p>';
+      h += '<div class="row"><button class="btn" data-action="nav" data-view="home">Home</button><button class="btn" data-action="nav" data-view="stats">See your stats</button></div>';
+    }
   }
   if (step !== 'done') h += '<div class="row"><button class="btn" data-action="leaveLesson">Leave lesson</button></div>';
   return h;
@@ -583,6 +788,75 @@ function viewReview() {
   return h;
 }
 
+// ----- Stats tab -----
+function statTile(label, value, tone) {
+  return '<div class="tile"><span class="tile-v ' + (tone || '') + '">' + esc(value) + '</span><span class="tile-l">' + esc(label) + '</span></div>';
+}
+
+function lessonStatHtml(c, l, i) {
+  const key = c.id + ':' + i;
+  let right, body;
+  if (l.completed && typeof l.score === 'number') {
+    const r = rating(l.score);
+    right = starsHtml(r.stars, r.tone) + ' <span class="pct ' + r.tone + '">' + l.score + '% ' + esc(r.word) + '</span>';
+  } else if (l.completed) right = '<span class="pill">Completed, no quiz</span>';
+  else right = '<span class="pill">Not done yet</span>';
+
+  if (!l.completed) {
+    body = '<p class="muted">Finish this lesson to see your results here.</p>';
+  } else {
+    const r = l.result;
+    let well = '', imp = '';
+    if (r) {
+      well = r.right.length
+        ? r.right.slice(0, 6).map(q => '<li>Got right: ' + esc(q) + '</li>').join('')
+        : '<li>You finished the lesson. Scores improve with review, so keep going.</li>';
+      imp = r.missed.length
+        ? r.missed.map(x => '<li><strong>' + esc(x.q) + '</strong><br>You chose: ' + esc(x.yours) + '. Correct: ' + esc(x.right) + '. ' + esc(x.why) + '</li>').join('')
+        : '<li>Nothing missed. Keep it fresh with spaced review.</li>';
+    } else {
+      well = '<li>You completed the lesson.</li>';
+      imp = '<li>No quiz was taken, so there is no score. Turn on the quiz method in Settings to measure what sticks.</li>';
+    }
+    body = '<h4>What you did well</h4><ul>' + well + '</ul><h4>What to improve</h4><ul>' + imp + '</ul>';
+    if (l.explainFeedback) body += '<h4>Feedback on your own summary</h4>' + paras(l.explainFeedback);
+    if (l.coach) body += '<h4>AI coach</h4>' + paras(l.coach.didWell) + paras(l.coach.improve);
+    if (l.attempts && l.attempts.length > 1) body += '<p class="muted">Quiz attempts: ' + l.attempts.map(a => a.score + '%').join(' then ') + '</p>';
+    const a = 'data-id="' + c.id + '" data-i="' + i + '"';
+    body += '<div class="row">' + (l.coach ? '' : '<button class="btn" data-action="coach" ' + a + (ui.busy ? ' disabled' : '') + '>Ask AI for a deeper breakdown</button>') +
+      (l.content ? '<button class="btn" data-action="reread" ' + a + '>Read again</button>' : '') +
+      '<button class="btn" data-action="startLesson" ' + a + '>Retake quiz</button></div>';
+  }
+  const open = ui.statOpen[key] === true;
+  return '<details class="lesson-stat" data-key="' + esc(key) + '"' + (open ? ' open' : '') + '><summary><span class="ls-title">' + (i + 1) + '. ' + esc(l.title) + '</span><span class="ls-score">' + right + '</span></summary><div class="ls-body">' + body + '</div></details>';
+}
+
+function viewStats() {
+  if (!state.courses.length) return '<h2>Stats</h2><p>No courses yet. Finish a lesson and your results will appear here.</p>';
+  const all = [];
+  state.courses.forEach(c => c.lessons.forEach(l => all.push(l)));
+  const done = all.filter(l => l.completed);
+  const scored = done.filter(l => typeof l.score === 'number');
+  const avg = scored.length ? Math.round(scored.reduce((s, l) => s + l.score, 0) / scored.length) : null;
+  let h = '<h2>Your progress</h2><div class="tiles">' +
+    statTile('Day streak', currentStreak(state.activity)) +
+    statTile('Lessons done', done.length + ' of ' + all.length) +
+    statTile('Average score', avg == null ? '-' : avg + '%', avg == null ? '' : rating(avg).tone) +
+    statTile('Reviews due', dueCards(state.cards).length) + '</div>';
+  state.courses.forEach(c => {
+    const d = c.lessons.filter(l => l.completed).length;
+    const sc = c.lessons.filter(l => typeof l.score === 'number');
+    const cavg = sc.length ? Math.round(sc.reduce((s, l) => s + l.score, 0) / sc.length) : null;
+    const key = 'course:' + c.id;
+    const open = ui.statOpen[key] !== false;
+    h += '<details class="course-stat" data-key="' + esc(key) + '"' + (open ? ' open' : '') + '><summary><strong>' + esc(c.title) + '</strong> <span class="muted">' + d + ' of ' + c.lessons.length + ' done' +
+      (cavg == null ? '' : ', average <span class="pct ' + rating(cavg).tone + '">' + cavg + '%</span>') + '</span></summary>';
+    c.lessons.forEach((l, i) => { h += lessonStatHtml(c, l, i); });
+    h += '</details>';
+  });
+  return h;
+}
+
 function viewSettings() {
   const s = state.settings;
   function chk(key, label, help, kind) {
@@ -599,7 +873,7 @@ function viewSettings() {
     '<label class="field" for="s-model">Model name</label><input type="text" id="s-model" data-setting="model" value="' + esc(s.model) + '" autocapitalize="off" spellcheck="false">' +
     '<p class="muted">If the AI says a model was not found, look up a current free model name in Google AI Studio and paste it here.</p>' +
     '<div class="row"><button class="btn" data-action="testKey"' + (ui.busy ? ' disabled' : '') + '>Test connection</button></div>';
-  h += '<h2>Teaching methods</h2><p class="muted">Switch any combination on or off. Applies to lessons created from now on (use Regenerate to redo a lesson).</p>';
+  h += '<h2>Teaching methods</h2><p class="muted">Switch any combination on or off. Applies to lessons created from now on (use Regenerate on a lesson\'s last page to redo it).</p>';
   Object.keys(METHOD_INFO).forEach(k => { h += chk(k, METHOD_INFO[k].label, METHOD_INFO[k].help, 'method'); });
   h += '<h2>Schedule</h2>' + chk('allowAhead', 'Let me work ahead', 'Open upcoming lessons early instead of waiting for their date.', 'setting');
   h += '<h2>Accessibility</h2>' +
@@ -624,29 +898,44 @@ function inlineMsg(text) {
 }
 function setError(e) { ui.message = { type: 'error', text: (e && e.message) || String(e) }; }
 
+// Called while the AI is writing: shows the status lines it reports.
+function updateLog(text) {
+  const lines = extractLog(text);
+  if (lines.length === ui.log.length) return;
+  ui.log = lines;
+  const ul = document.getElementById('busy-log');
+  if (ul) ul.innerHTML = lines.map(l => '<li>' + esc(l) + '</li>').join('');
+  if (lines.length) announce(lines[lines.length - 1]);
+}
+
 async function withBusy(text, fn) {
-  ui.busy = text; ui.message = null; render(); announce(text);
+  ui.busy = text; ui.message = null; ui.log = []; render(); announce(text);
   try { return await fn(); }
-  finally { ui.busy = null; }
+  finally { ui.busy = null; ui.log = []; }
 }
 
 async function createCourse() {
+  const auto = document.getElementById('f-auto').checked;
   const d = {
     topic: document.getElementById('f-topic').value.trim(),
     level: document.getElementById('f-level').value,
     period: document.getElementById('f-period').value,
-    count: parseInt(document.getElementById('f-count').value, 10),
+    auto: auto,
+    count: auto ? null : parseInt(document.getElementById('f-count').value, 10),
     notes: document.getElementById('f-notes').value.trim()
   };
-  ui.draft = d;
+  ui.draft = Object.assign({}, d, { count: document.getElementById('f-count').value });
   if (!d.topic) return inlineErrorNew('Please type what you want to learn.');
-  if (!(d.count >= 1 && d.count <= 30)) return inlineErrorNew('Choose between 1 and 30 lessons.');
+  if (!auto && !(d.count >= 1 && d.count <= MAX_LESSONS)) return inlineErrorNew('Choose between 1 and ' + MAX_LESSONS + ' lessons.');
   try {
-    const out = await withBusy('Planning your course...', () => callAI(buildOutlinePrompt(d)));
+    const out = await withBusy('Planning your course...', () => callAI(buildOutlinePrompt(d), updateLog));
     let lessons = (out && Array.isArray(out.lessons)) ? out.lessons.filter(l => l && l.title) : [];
     if (!lessons.length) throw new Error('The AI did not return a course plan. Please try again.');
-    lessons = lessons.slice(0, d.count).map(l => ({ title: String(l.title), summary: String(l.summary || ''), completed: false, content: null }));
-    const course = { id: uid(), title: String((out && out.title) || d.topic), level: d.level, period: d.period, start: todayStr(), lessons: lessons };
+    lessons = lessons.slice(0, d.count || MAX_LESSONS).map(l => ({ title: String(l.title), summary: String(l.summary || ''), completed: false, content: null }));
+    const course = {
+      id: uid(), title: String((out && out.title) || d.topic), level: d.level, period: d.period, start: todayStr(), lessons: lessons,
+      countReason: d.count ? '' : String((out && out.reason) || '').slice(0, 300)
+    };
     state.courses.push(course);
     saveState();
     ui.draft = {};
@@ -657,7 +946,7 @@ async function createCourse() {
 }
 function inlineErrorNew(text) { ui.message = { type: 'error', text: text }; ui.focus = '#main'; render(); }
 
-async function startLesson(courseId, index) {
+async function startLesson(courseId, index, opts) {
   const c = getCourse(courseId);
   if (!c) return;
   const lesson = c.lessons[index];
@@ -665,35 +954,47 @@ async function startLesson(courseId, index) {
   try {
     if (!lesson.content) {
       ui.view = 'lesson'; ui.session = null;
-      lesson.content = await withBusy('Writing your lesson...', async () => cleanLesson(await callAI(buildLessonPrompt(c, index, m))));
+      lesson.content = await withBusy('Writing your lesson...', async () => cleanLesson(await callAI(buildLessonPrompt(c, index, m), updateLog)));
       saveState();
     }
-    openSession(c, index);
+    openSession(c, index, opts);
   } catch (e) {
     setError(e);
     ui.view = 'course'; ui.courseId = courseId; render();
   }
 }
 
-function openSession(c, index) {
+function openSession(c, index, opts) {
+  opts = opts || {};
   const lesson = c.lessons[index], content = lesson.content, m = state.settings.methods;
-  const steps = stepsFor(content, m);
-  const quizItems = content.quiz.map(q => Object.assign({ kind: 'new' }, q));
-  let items = quizItems;
-  if (m.interleave) {
-    const old = pickInterleaved(state.cards, c.id, index, 3).map(card => ({
-      kind: 'review', cardId: card.id, review: true, q: card.q, options: card.options, correct: card.correct, explanation: card.explanation
-    }));
-    items = shuffle(quizItems.concat(old));
+  const reread = opts.mode === 'reread';
+  const pages = buildPages(content);
+  let page = typeof opts.page === 'number' ? opts.page : ((!reread && !lesson.completed && lesson.lastPage) ? lesson.lastPage : 0);
+  page = Math.max(0, Math.min(page, pages.length - 1));
+  let steps = reread ? ['lesson', 'done'] : stepsFor(content, m);
+  if (!reread && page > 0) steps = steps.filter(s => s !== 'pretest');
+  let items = [];
+  if (!reread) {
+    const quizItems = content.quiz.map(q => Object.assign({ kind: 'new' }, q));
+    items = quizItems;
+    if (m.interleave) {
+      const old = pickInterleaved(state.cards, c.id, index, 3).map(card => ({
+        kind: 'review', cardId: card.id, review: true, q: card.q, options: card.options, correct: card.correct, explanation: card.explanation
+      }));
+      items = shuffle(quizItems.concat(old));
+    }
   }
-  ui.session = { courseId: c.id, index: index, steps: steps, step: 0, preItems: content.preTest, preAnswers: null, quizItems: items, quizAnswers: null, explainText: '', feedback: null };
+  ui.session = {
+    courseId: c.id, index: index, mode: reread ? 'reread' : 'normal', steps: steps, step: steps.indexOf('pretest') >= 0 ? 0 : steps.indexOf('lesson'),
+    pages: pages, page: page, preItems: content.preTest, preAnswers: null, quizItems: items, quizAnswers: null, explainText: '', feedback: null
+  };
   go('lesson', { courseId: c.id, focus: '#step-title' });
 }
 
 function nextStep() {
   const S = ui.session;
   S.step++;
-  if (S.steps[S.step] === 'done') completeLesson();
+  if (S.steps[S.step] === 'done' && S.mode !== 'reread') completeLesson();
   window.scrollTo(0, 0);
   ui.focus = S.steps[S.step] === 'done' ? '#result' : '#step-title';
   render();
@@ -703,8 +1004,37 @@ function completeLesson() {
   const S = ui.session, c = getCourse(S.courseId), lesson = c.lessons[S.index];
   lesson.completed = true;
   lesson.completedOn = todayStr();
-  if (S.quizAnswers) lesson.score = Math.round(100 * scoreOf(S.quizItems, S.quizAnswers) / S.quizItems.length);
+  lesson.lastPage = 0;
+  markActive();
   saveState();
+}
+
+function turnPage(dir) {
+  const S = ui.session;
+  setPage(S.page + dir);
+}
+function setPage(n) {
+  const S = ui.session;
+  if (!(n >= 0 && n < S.pages.length)) return;
+  S.page = n;
+  const lesson = getCourse(S.courseId).lessons[S.index];
+  if (S.mode !== 'reread' && !lesson.completed) { lesson.lastPage = n; saveState(); }
+  if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+  window.scrollTo(0, 0);
+  ui.focus = '#page-title';
+  render();
+}
+
+function toggleBookmark() {
+  const S = ui.session;
+  const i = state.bookmarks.findIndex(b => b.courseId === S.courseId && b.lessonIndex === S.index && b.page === S.page);
+  if (i >= 0) state.bookmarks.splice(i, 1);
+  else state.bookmarks.push({ id: uid(), courseId: S.courseId, lessonIndex: S.index, page: S.page, label: S.pages[S.page].heading, on: todayStr() });
+  saveState();
+  render();
+  const b = document.querySelector('[data-action="bookmark"]');
+  if (b) b.focus();
+  announce(i >= 0 ? 'Bookmark removed' : 'Page bookmarked');
 }
 
 function submitPre() {
@@ -714,10 +1044,27 @@ function submitPre() {
 }
 
 function submitQuiz() {
-  const S = ui.session, c = getCourse(S.courseId), m = state.settings.methods, today = todayStr();
+  const S = ui.session, c = getCourse(S.courseId), lesson = c.lessons[S.index], m = state.settings.methods, today = todayStr();
   const a = readAnswers(S.quizItems.length);
   if (a.indexOf(null) >= 0) return inlineMsg('Please answer every question.');
   S.quizAnswers = a;
+
+  // This lesson's own questions decide the lesson score (older mixed-in questions do not).
+  const mine = S.quizItems.map((it, n) => ({ it: it, n: n })).filter(x => x.it.kind === 'new');
+  if (mine.length) {
+    const right = mine.filter(x => a[x.n] === x.it.correct);
+    const wrong = mine.filter(x => a[x.n] !== x.it.correct);
+    const score = Math.round(100 * right.length / mine.length);
+    lesson.result = {
+      date: today, total: mine.length, correct: right.length, score: score,
+      right: right.map(x => x.it.q),
+      missed: wrong.map(x => ({ q: x.it.q, yours: x.it.options[a[x.n]], right: x.it.options[x.it.correct], why: x.it.explanation }))
+    };
+    lesson.score = score;
+    lesson.attempts = (lesson.attempts || []).concat([{ date: today, score: score }]).slice(-20);
+    delete lesson.coach;   // an old AI breakdown no longer matches this attempt
+  }
+
   if (m.spaced || m.interleave) {
     // Replace any older cards from this lesson (e.g. when retaking it).
     const fresh = S.quizItems.filter(it => it.kind === 'new');
@@ -733,8 +1080,8 @@ function submitQuiz() {
         if (card) gradeCard(card, ok, today);
       }
     });
-    saveState();
   }
+  saveState();
   ui.focus = '#result'; render();
 }
 
@@ -746,17 +1093,31 @@ async function submitExplain() {
   try {
     const out = await withBusy('Reading your explanation...', () => callAI(buildFeedbackPrompt(c, lesson, lesson.content, text)));
     S.feedback = String((out && out.feedback) || 'No feedback was returned.');
+    lesson.explainFeedback = S.feedback;
+    saveState();
     ui.focus = '#result';
+  } catch (e) { setError(e); }
+  render();
+}
+
+async function coach(courseId, index) {
+  const c = getCourse(courseId);
+  if (!c) return;
+  const lesson = c.lessons[index];
+  ui.statOpen[courseId + ':' + index] = true;
+  try {
+    const out = await withBusy('Reviewing your results...', () => callAI(buildCoachPrompt(c, lesson)));
+    lesson.coach = { didWell: String((out && out.didWell) || ''), improve: String((out && out.improve) || '') };
+    saveState();
   } catch (e) { setError(e); }
   render();
 }
 
 function speak() {
   if (!('speechSynthesis' in window)) { ui.message = { type: 'error', text: 'Read aloud is not supported in this browser.' }; return render(); }
-  const S = ui.session, c = getCourse(S.courseId), content = c.lessons[S.index].content;
-  const text = [c.lessons[S.index].title].concat(content.sections.map(s => s.heading + '. ' + s.text)).concat(content.analogy ? [content.analogy] : []).concat(content.keyTakeaways).join('\n');
+  const S = ui.session;
   window.speechSynthesis.cancel();
-  window.speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+  window.speechSynthesis.speak(new SpeechSynthesisUtterance(pageText(S.pages[S.page])));
 }
 
 function startReview() {
@@ -772,6 +1133,7 @@ function reviewAnswer(k) {
   const ok = k === card.correct;
   if (ok) R.correct++;
   gradeCard(card, ok);
+  markActive();
   saveState();
   ui.focus = '#result'; render();
 }
@@ -797,7 +1159,9 @@ function importData(file) {
       const d = defaultState();
       state = {
         settings: Object.assign({}, d.settings, p.settings, { methods: Object.assign({}, d.settings.methods, (p.settings && p.settings.methods) || {}), apiKey: key }),
-        courses: p.courses, cards: p.cards
+        courses: p.courses, cards: p.cards,
+        bookmarks: Array.isArray(p.bookmarks) ? p.bookmarks : [],
+        activity: Array.isArray(p.activity) ? p.activity : []
       };
       saveState(); ui.message = { type: 'ok', text: 'Backup restored.' };
     } catch (e) { ui.message = { type: 'error', text: 'That file is not a valid backup.' }; }
@@ -811,19 +1175,39 @@ async function handleAction(a, data) {
     case 'nav': ui.session = null; if (data.view !== 'review') ui.review = null; return go(data.view);
     case 'newCourse': return go('new');
     case 'createCourse': return createCourse();
-    case 'openCourse': return go('course', { courseId: data.id });
+    case 'openCourse': ui.session = null; return go('course', { courseId: data.id });
     case 'deleteCourse':
       if (window.confirm('Delete this course and its review questions? This cannot be undone.')) {
         state.courses = state.courses.filter(c => c.id !== data.id);
         state.cards = state.cards.filter(c => c.courseId !== data.id);
+        state.bookmarks = state.bookmarks.filter(b => b.courseId !== data.id);
         saveState(); return go('home');
       }
       return;
     case 'startLesson': return startLesson(data.id, parseInt(data.i, 10));
+    case 'reread': {
+      const c = getCourse(data.id), i = parseInt(data.i, 10);
+      if (!c || !c.lessons[i] || !c.lessons[i].content) return;
+      return openSession(c, i, { mode: 'reread' });
+    }
+    case 'openBookmark': {
+      const b = state.bookmarks.find(x => x.id === data.id);
+      const c = b && getCourse(b.courseId);
+      if (!c || !c.lessons[b.lessonIndex] || !c.lessons[b.lessonIndex].content) { ui.message = { type: 'error', text: 'That bookmarked lesson is no longer available.' }; return render(); }
+      return openSession(c, b.lessonIndex, { mode: c.lessons[b.lessonIndex].completed ? 'reread' : 'normal', page: b.page });
+    }
+    case 'removeBookmark':
+      state.bookmarks = state.bookmarks.filter(x => x.id !== data.id);
+      saveState(); return render();
+    case 'bookmark': return toggleBookmark();
+    case 'page': return turnPage(parseInt(data.dir, 10));
     case 'regen': {
-      if (!window.confirm('Write this lesson again with your current settings? Its quiz questions will be replaced.')) return;
+      if (!window.confirm('Write this lesson again with your current settings? Its quiz questions and bookmarks will be replaced.')) return;
       const S = ui.session, c = getCourse(S.courseId);
       c.lessons[S.index].content = null;
+      c.lessons[S.index].lastPage = 0;
+      state.bookmarks = state.bookmarks.filter(b => !(b.courseId === S.courseId && b.lessonIndex === S.index));
+      saveState();
       return startLesson(S.courseId, S.index);
     }
     case 'leaveLesson': ui.session = null; return go('course', { courseId: ui.courseId });
@@ -831,6 +1215,7 @@ async function handleAction(a, data) {
     case 'submitPre': return submitPre();
     case 'submitQuiz': return submitQuiz();
     case 'submitExplain': return submitExplain();
+    case 'coach': return coach(data.id, parseInt(data.i, 10));
     case 'speak': return speak();
     case 'stopSpeak': if ('speechSynthesis' in window) window.speechSynthesis.cancel(); return;
     case 'startReview': return startReview();
@@ -867,11 +1252,20 @@ function init() {
       state.settings.methods[t.dataset.method] = t.checked; saveState();
       if (t.dataset.method === 'spaced') { const rb = document.getElementById('nav-review'); if (rb) rb.hidden = !t.checked; }
     } else if (t.id === 'import-file') importData(t.files[0]);
+    else if (t.id === 'f-auto') {
+      const w = document.getElementById('count-wrap');
+      if (w) w.hidden = t.checked;
+    } else if (t.id === 'jump' && ui.session) setPage(parseInt(t.value, 10));
   });
   document.addEventListener('input', e => {
     const t = e.target;
     if (t.dataset && t.dataset.setting === 'fontScale') { state.settings.fontScale = parseFloat(t.value); applySettings(); }
   });
+  // Remember which Stats dropdowns are open (the "toggle" event does not bubble, so listen while it travels down).
+  document.addEventListener('toggle', e => {
+    const d = e.target;
+    if (d && d.tagName === 'DETAILS' && d.dataset && d.dataset.key) ui.statOpen[d.dataset.key] = d.open;
+  }, true);
   render();
 }
 
@@ -879,5 +1273,5 @@ if (typeof document !== 'undefined') {
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 }
 if (typeof module !== 'undefined') {
-  module.exports = { nextBox, gradeCard, dueCards, pickInterleaved, lessonStatus, lessonDate, addDays, cleanQuestion, cleanLesson, parseJSON, buildLessonPrompt, buildOutlinePrompt };
+  module.exports = { nextBox, gradeCard, dueCards, pickInterleaved, lessonStatus, lessonDate, addDays, cleanQuestion, cleanLesson, cleanVisual, parseJSON, extractLog, rating, currentStreak, buildPages, buildLessonPrompt, buildOutlinePrompt };
 }
