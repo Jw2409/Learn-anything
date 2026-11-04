@@ -139,6 +139,7 @@ async function syncServer(force) {
 
 function cleanServerUrl(s) {
   s = String(s || '').trim().replace(/\/+$/, '');
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) s = 'https://' + s;   // forgive a missing https://
   if (!/^https:\/\/[^\s/]+\.[^\s/]+/.test(s)) throw new Error('The server address should start with https:// and look like https://something.workers.dev');
   return s;
 }
