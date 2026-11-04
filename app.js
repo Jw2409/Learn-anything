@@ -36,6 +36,8 @@ function defaultState() {
   return {
     settings: {
       apiKey: '',
+      backupKeys: '',   // more API keys, one per line (used if the main one runs out)
+      keyStatus: {},    // which keys are resting, and until when
       model: 'gemini-2.5-flash',
       theme: 'auto',
       fontScale: 1,
@@ -251,6 +253,56 @@ function extractLog(text) {
   return out.slice(0, 8);
 }
 
+// ----- API keys: a main key plus optional backups -----
+// A "key" is like a ticket to use Google's AI. Each ticket has a daily/minute
+// allowance. If one is used up it "rests" until its allowance comes back, and
+// the app moves on to the next ticket.
+
+function keyId(k) {
+  let h = 5381;
+  for (let i = 0; i < k.length; i++) h = ((h * 33) ^ k.charCodeAt(i)) >>> 0;
+  return h.toString(36);
+}
+function apiKeys() {
+  const s = state.settings;
+  const all = [s.apiKey].concat(String(s.backupKeys || '').split(/\s+/)).map(k => String(k || '').trim()).filter(Boolean);
+  return all.filter((k, i) => all.indexOf(k) === i);
+}
+function keyLabel(k, i) { return 'Key ' + (i + 1) + ' (...' + k.slice(-4) + ')'; }
+function keyRest(k) {
+  const st = (state.settings.keyStatus || {})[keyId(k)];
+  return st && st.until > Date.now() ? st : null;
+}
+function restKey(k, until, why) {
+  if (!state.settings.keyStatus) state.settings.keyStatus = {};
+  state.settings.keyStatus[keyId(k)] = { until: until, why: why };
+  saveState();
+}
+function clockTime(ms) { return new Date(ms).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }); }
+
+// Google's daily free limits reset at midnight Pacific time.
+function msUntilPacificMidnight(now) {
+  const o = {};
+  new Intl.DateTimeFormat('en-US', { timeZone: 'America/Los_Angeles', hourCycle: 'h23', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    .formatToParts(new Date(now)).forEach(p => { o[p.type] = parseInt(p.value, 10); });
+  return 24 * 3600 * 1000 - (((o.hour % 24) * 3600 + o.minute * 60 + o.second) * 1000);
+}
+// How long a key that hit its limit should rest, judging from Google's message.
+function quotaRest(detail, now) {
+  now = now || Date.now();
+  const d = String(detail || '');
+  if (/PerDay|per day|daily/i.test(d)) return { until: now + msUntilPacificMidnight(now) + 60000, why: 'daily limit reached' };
+  const m = /"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/.exec(d) || /retry in (\d+(?:\.\d+)?)s/i.exec(d);
+  const sec = m ? Math.ceil(parseFloat(m[1])) + 2 : 65;
+  return { until: now + Math.min(sec, 3600) * 1000, why: 'minute limit reached' };
+}
+
+function aiError(kind, message, extra) {
+  const e = new Error(message);
+  e.kind = kind;   // quota | badkey | busy | network | drop | other
+  return Object.assign(e, extra || {});
+}
+
 // One line of the streaming answer ("data: {...}") -> the text inside it.
 function sseText(line) {
   if (line.indexOf('data:') !== 0) return '';
@@ -258,18 +310,20 @@ function sseText(line) {
   if (!payload || payload === '[DONE]') return '';
   let o;
   try { o = JSON.parse(payload); } catch (e) { return ''; }
-  if (o.error) throw new Error('AI error: ' + (o.error.message || 'unknown'));
+  if (o.error) {
+    throw aiError(o.error.code === 429 || o.error.status === 'RESOURCE_EXHAUSTED' ? 'quota' : 'other', 'AI error: ' + (o.error.message || 'unknown'), { detail: payload });
+  }
   const parts = o.candidates && o.candidates[0] && o.candidates[0].content && o.candidates[0].content.parts;
   return parts ? parts.filter(p => !p.thought).map(p => p.text || '').join('') : '';
 }
 
-// To use a different AI later, only this function needs to change. It takes a
-// prompt, calls onText(textSoFar) while the answer streams in, and returns a
-// JavaScript object parsed from the AI's JSON answer.
-async function callAI(prompt, onText) {
+// Ask the AI once, with one key. Returns the text it wrote. If it breaks off
+// part-way, the error carries what was written so far (e.partial).
+async function streamOnce(key, prompt, onText, jsonMode) {
   const s = state.settings;
-  if (!s.apiKey) throw new Error('Add your Gemini API key in Settings first.');
   const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(s.model) + ':streamGenerateContent?alt=sse';
+  const gen = { temperature: 0.7 };
+  if (jsonMode) gen.responseMimeType = 'application/json';
   let res;
   // Google's free models sometimes answer 503 ("busy"). That is shared
   // capacity, not your key, so wait a moment and try again (up to 3 retries).
@@ -278,14 +332,11 @@ async function callAI(prompt, onText) {
     try {
       res = await fetch(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': s.apiKey },
-        body: JSON.stringify({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: { responseMimeType: 'application/json', temperature: 0.7 }
-        })
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: gen })
       });
     } catch (e) {
-      throw new Error('Could not reach the AI. Check your internet connection.');
+      throw aiError('network', 'Could not reach the AI. Check your internet connection.');
     }
     if (res.status === 503 && attempt < waits.length) {
       await new Promise(r => setTimeout(r, waits[attempt]));
@@ -294,35 +345,133 @@ async function callAI(prompt, onText) {
     break;
   }
   if (res.status === 503) {
-    throw new Error('Google\'s AI is busy right now. This is shared capacity, not a problem with your key. Wait a minute and try again, or change the model name in Settings to a lighter one such as gemini-2.5-flash-lite.');
+    throw aiError('busy', 'Google\'s AI is busy right now. This is shared capacity, not a problem with your key. Wait a minute and try again, or change the model name in Settings to a lighter one such as gemini-2.5-flash-lite.');
   }
   if (!res.ok) {
-    let detail = '';
-    try { const e = await res.json(); detail = (e.error && e.error.message) || ''; } catch (e2) { /* ignore */ }
-    if (res.status === 429) throw new Error('The free AI limit was reached. Wait a minute and try again.');
-    if (res.status === 400 || res.status === 403) throw new Error('The AI rejected the request. Check your API key and model name in Settings. ' + detail);
-    if (res.status === 404) throw new Error('That model name was not found. Change the model in Settings. ' + detail);
-    throw new Error('AI error ' + res.status + '. ' + detail);
+    let raw = '', detail = '';
+    try { raw = await res.text(); detail = (JSON.parse(raw).error || {}).message || ''; } catch (e) { /* ignore */ }
+    if (res.status === 429) throw aiError('quota', 'The free AI limit was reached. Wait a minute and try again.', { detail: raw });
+    if (res.status === 403 || (res.status === 400 && /API key not valid|API_KEY_INVALID|API key expired/i.test(raw))) {
+      throw aiError('badkey', 'The AI rejected the request. Check your API key and model name in Settings. ' + detail, { detail: raw });
+    }
+    if (res.status === 400) throw aiError('other', 'The AI rejected the request. Check your API key and model name in Settings. ' + detail);
+    if (res.status === 404) throw aiError('other', 'That model name was not found. Change the model in Settings. ' + detail);
+    throw aiError('other', 'AI error ' + res.status + '. ' + detail);
   }
   let text = '', buf = '';
-  if (res.body && res.body.getReader) {
-    const reader = res.body.getReader(), dec = new TextDecoder();
-    for (;;) {
-      let chunk;
-      try { chunk = await reader.read(); } catch (e) { throw new Error('The connection dropped while the AI was writing. Please try again.'); }
-      if (chunk.done) break;
-      buf += dec.decode(chunk.value, { stream: true });
-      let nl;
-      while ((nl = buf.indexOf('\n')) >= 0) { text += sseText(buf.slice(0, nl).trim()); buf = buf.slice(nl + 1); }
-      if (onText) onText(text);
+  try {
+    if (res.body && res.body.getReader) {
+      const reader = res.body.getReader(), dec = new TextDecoder();
+      for (;;) {
+        let chunk;
+        try { chunk = await reader.read(); } catch (e) { throw aiError('drop', 'The connection dropped while the AI was writing. Please try again.'); }
+        if (chunk.done) break;
+        buf += dec.decode(chunk.value, { stream: true });
+        let nl;
+        while ((nl = buf.indexOf('\n')) >= 0) { text += sseText(buf.slice(0, nl).trim()); buf = buf.slice(nl + 1); }
+        if (onText) onText(text);
+      }
+      text += sseText(buf.trim());
+    } else {
+      (await res.text()).split('\n').forEach(l => { text += sseText(l.trim()); });
     }
-    text += sseText(buf.trim());
-  } else {
-    (await res.text()).split('\n').forEach(l => { text += sseText(l.trim()); });
+  } catch (e) {
+    e.partial = text;
+    throw e;
   }
   if (onText) onText(text);
-  if (!text) throw new Error('The AI returned an empty answer. Please try again.');
-  return parseJSON(text);
+  if (!text) throw aiError('other', 'The AI returned an empty answer. Please try again.');
+  return text;
+}
+
+// When a key gives out in the middle of an answer, the next key is shown
+// exactly what was written so far and asked to carry on from that character.
+function continuationPrompt(prompt, partial) {
+  return prompt + '\n\nIMPORTANT: an earlier attempt at this answer was cut off. Everything written so far is between the markers below.\n<<<START\n' + partial + '\nEND>>>\n' +
+    'Continue from exactly the next character after the last character shown. Output ONLY the remaining text, with no repetition of anything above, no code fences and no commentary, so that the old text followed by your text forms one complete, valid JSON answer.';
+}
+// Glue the new text onto the old, removing anything the AI repeated.
+function joinContinuation(partial, more) {
+  more = String(more).replace(/^\s*```(?:json)?\s*/i, '').replace(/```\s*$/, '');
+  const max = Math.min(partial.length, more.length, 300);
+  for (let n = max; n >= 12; n--) {
+    if (partial.slice(-n) === more.slice(0, n)) { more = more.slice(n); break; }
+  }
+  return partial + more;
+}
+
+function restingMessage(keys, lastErr) {
+  if (keys.length === 1 && lastErr && lastErr.kind !== 'quota') return lastErr.message;
+  const waits = keys.map(k => keyRest(k)).filter(Boolean);
+  if (!waits.length && lastErr) return lastErr.message;
+  const soonest = waits.length ? Math.min.apply(null, waits.map(w => w.until)) : 0;
+  if (keys.length === 1) return 'The free AI limit was reached. Wait a minute and try again' + (soonest ? ' (ready again about ' + clockTime(soonest) + ')' : '') + '.';
+  return 'All ' + keys.length + ' API keys are used up or were rejected right now' + (soonest ? '. The first one is ready again about ' + clockTime(soonest) : '') + '. You can check each key in Settings.';
+}
+
+// To use a different AI later, change streamOnce (and the key handling above).
+// callAI takes a prompt, calls onText(textSoFar) while the answer streams in,
+// and returns a JavaScript object parsed from the AI's JSON answer. It walks
+// through your keys in order, skipping any that are resting.
+async function callAI(prompt, onText, onNote) {
+  onNote = onNote || (typeof setBusyNote === 'function' ? setBusyNote : null);
+  const keys = apiKeys();
+  if (!keys.length) throw new Error('Add your Gemini API key in Settings first.');
+  const queue = keys.filter(k => !keyRest(k));
+  if (!queue.length) throw new Error(restingMessage(keys, null));
+  let partial = '', lastErr = null, dropRetried = false;
+  while (queue.length) {
+    const key = queue.shift(), idx = keys.indexOf(key), cont = partial.length > 0;
+    try {
+      if (onNote && (cont || idx > 0)) onNote(keyLabel(key, idx) + (cont ? ': carrying on from where the last key stopped' : ': working on it'));
+      const text = await streamOnce(key, cont ? continuationPrompt(prompt, partial) : prompt, cont ? (t => onText && onText(partial + t)) : onText, !cont);
+      if (!cont) return parseJSON(text);
+      try { return parseJSON(joinContinuation(partial, text)); } catch (e1) {
+        try { return parseJSON(text); } catch (e2) {   // the AI may have rewritten the whole answer
+          lastErr = e1; partial = '';
+          if (onNote) onNote('The joined answer did not fit together, starting that part again');
+          continue;
+        }
+      }
+    } catch (e) {
+      lastErr = e;
+      if (e.partial && (e.kind === 'quota' || e.kind === 'drop')) partial = cont ? joinContinuation(partial, e.partial) : e.partial;
+      if (e.kind === 'quota') {
+        const r = quotaRest(e.detail);
+        restKey(key, r.until, r.why);
+        if (onNote && queue.length) onNote(keyLabel(key, idx) + ' is out of quota. Switching keys.');
+        continue;
+      }
+      if (e.kind === 'badkey') {
+        restKey(key, Date.now() + 3600 * 1000, 'rejected by Google');
+        if (onNote && queue.length) onNote(keyLabel(key, idx) + ' was rejected. Switching keys.');
+        continue;
+      }
+      if (e.kind === 'drop' && !dropRetried) { dropRetried = true; queue.push(key); continue; }
+      throw e;
+    }
+  }
+  throw new Error(restingMessage(keys, lastErr));
+}
+
+// Check every key once and report.
+async function testAllKeys() {
+  const keys = apiKeys();
+  if (!keys.length) throw new Error('Add your Gemini API key first.');
+  const results = [];
+  for (let i = 0; i < keys.length; i++) {
+    try {
+      await streamOnce(keys[i], 'Reply with exactly this JSON: {"ok": true}', null, true);
+      if (state.settings.keyStatus) delete state.settings.keyStatus[keyId(keys[i])];
+      results.push({ ok: true, text: keyLabel(keys[i], i) + ' works' });
+    } catch (e) {
+      if (e.kind === 'quota') { const r = quotaRest(e.detail); restKey(keys[i], r.until, r.why); results.push({ ok: false, text: keyLabel(keys[i], i) + ' is out of quota (' + r.why + ')' }); }
+      else if (e.kind === 'badkey') { restKey(keys[i], Date.now() + 3600 * 1000, 'rejected by Google'); results.push({ ok: false, text: keyLabel(keys[i], i) + ' was rejected. Check that you copied it correctly.' }); }
+      else results.push({ ok: false, text: keyLabel(keys[i], i) + ': ' + e.message });
+    }
+  }
+  saveState();
+  return results;
 }
 
 const LOG_SHAPE = '"log": ["3 to 5 short status lines about what you are doing right now, in the style \'Compiling topic - <specific thing>\', \'Reviewing <specific thing>\' or \'Setting up <specific thing>\'"]';
@@ -489,7 +638,7 @@ function render() {
     html += '<div class="msg ' + ui.message.type + '" role="' + (ui.message.type === 'error' ? 'alert' : 'status') + '">' + esc(ui.message.text) + '</div>';
   }
   if (ui.busy) {
-    html += '<div class="busy" role="status"><strong>' + esc(ui.busy) + '</strong><ul id="busy-log" class="plain" aria-hidden="true">' +
+    html += '<div class="busy" role="status"><strong>' + esc(ui.busy) + '</strong><p id="busy-note" class="muted" style="margin:.2rem 0">' + esc(ui.busyNote || '') + '</p><ul id="busy-log" class="plain" aria-hidden="true">' +
       ui.log.map(l => '<li>' + esc(l) + '</li>').join('') + '</ul></div>';
   }
   const titles = { home: 'Learn Anything', new: 'New course', course: 'Course', lesson: 'Lesson', review: 'Review', stats: 'Stats', settings: 'Settings' };
@@ -860,6 +1009,23 @@ function viewStats() {
   return h;
 }
 
+// Backup keys box + a line per key saying whether it is ready or resting.
+function keysHtml() {
+  const s = state.settings, keys = apiKeys();
+  let h = '<label class="field" for="s-backupKeys">Backup API keys (optional, one per line)</label>' +
+    '<textarea id="s-backupKeys" data-setting="backupKeys" style="min-height:5rem" autocapitalize="off" spellcheck="false" autocomplete="off" placeholder="Paste extra keys here">' + esc(s.backupKeys || '') + '</textarea>' +
+    '<p class="muted">If a key runs out, the app moves on to the next one. If a key runs out partway through writing a lesson, the next key carries on from that exact point instead of starting over. Every key uses the model name below. Free limits are counted per Google project, so a second key from the same project will not help.</p>' +
+    '<p class="msg" style="border-color:var(--warn)"><strong>Heads up:</strong> Google\'s terms say not to get around its usage limits, and Google has restricted projects it believed were doing that with many accounts. Backups are safest when they are keys you are entitled to use, such as your own paid key.</p>';
+  if (keys.length) {
+    h += '<ul class="plain">' + keys.map((k, i) => {
+      const r = keyRest(k);
+      return '<li>' + esc(keyLabel(k, i)) + ': ' + (r ? '<span class="warn">resting until ' + esc(clockTime(r.until)) + ' (' + esc(r.why) + ')</span>' : '<span class="good">ready</span>') + '</li>';
+    }).join('') + '</ul>';
+    if (keys.some(k => keyRest(k))) h += '<div class="row"><button class="btn" data-action="clearRest">Clear resting timers</button></div>';
+  }
+  return h;
+}
+
 function viewSettings() {
   const s = state.settings;
   function chk(key, label, help, kind) {
@@ -873,9 +1039,10 @@ function viewSettings() {
   let h = '<h2>AI connection</h2>' +
     '<p class="muted">Get a free key at aistudio.google.com. It is saved only in this browser, on this device.</p>' +
     '<label class="field" for="s-apiKey">Gemini API key</label><input type="password" id="s-apiKey" data-setting="apiKey" value="' + esc(s.apiKey) + '" autocomplete="off" autocapitalize="off" spellcheck="false">' +
+    keysHtml() +
     '<label class="field" for="s-model">Model name</label><input type="text" id="s-model" data-setting="model" value="' + esc(s.model) + '" autocapitalize="off" spellcheck="false">' +
     '<p class="muted">If the AI says a model was not found, look up a current free model name in Google AI Studio and paste it here.</p>' +
-    '<div class="row"><button class="btn" data-action="testKey"' + (ui.busy ? ' disabled' : '') + '>Test connection</button></div>';
+    '<div class="row"><button class="btn" data-action="testKey"' + (ui.busy ? ' disabled' : '') + '>Test connection (all keys)</button></div>';
   h += '<h2>Teaching methods</h2><p class="muted">Switch any combination on or off. Applies to lessons created from now on (use Regenerate on a lesson\'s last page to redo it).</p>';
   Object.keys(METHOD_INFO).forEach(k => { h += chk(k, METHOD_INFO[k].label, METHOD_INFO[k].help, 'method'); });
   h += '<h2>Schedule</h2>' + chk('allowAhead', 'Let me work ahead', 'Open upcoming lessons early instead of waiting for their date.', 'setting');
@@ -912,10 +1079,18 @@ function updateLog(text) {
   if (lines.length) announce(lines[lines.length - 1]);
 }
 
+// Shows things like "Key 2: carrying on from where the last key stopped".
+function setBusyNote(text) {
+  ui.busyNote = text;
+  const el = document.getElementById('busy-note');
+  if (el) el.textContent = text;
+  announce(text);
+}
+
 async function withBusy(text, fn) {
-  ui.busy = text; ui.message = null; ui.log = []; render(); announce(text);
+  ui.busy = text; ui.message = null; ui.log = []; ui.busyNote = ''; render(); announce(text);
   try { return await fn(); }
-  finally { ui.busy = null; ui.log = []; }
+  finally { ui.busy = null; ui.log = []; ui.busyNote = ''; }
 }
 
 async function createCourse() {
@@ -1147,6 +1322,8 @@ function reviewAnswer(k) {
 function exportData() {
   const copy = JSON.parse(JSON.stringify(state));
   copy.settings.apiKey = '';
+  copy.settings.backupKeys = '';
+  copy.settings.keyStatus = {};
   const blob = new Blob([JSON.stringify(copy, null, 2)], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -1161,10 +1338,10 @@ function importData(file) {
     try {
       const p = JSON.parse(r.result);
       if (!p || !Array.isArray(p.courses) || !Array.isArray(p.cards)) throw new Error('bad');
-      const key = state.settings.apiKey;
+      const key = state.settings.apiKey, backups = state.settings.backupKeys;
       const d = defaultState();
       state = {
-        settings: Object.assign({}, d.settings, p.settings, { methods: Object.assign({}, d.settings.methods, (p.settings && p.settings.methods) || {}), apiKey: key }),
+        settings: Object.assign({}, d.settings, p.settings, { methods: Object.assign({}, d.settings.methods, (p.settings && p.settings.methods) || {}), apiKey: key, backupKeys: backups, keyStatus: state.settings.keyStatus || {} }),
         courses: p.courses, cards: p.cards,
         bookmarks: Array.isArray(p.bookmarks) ? p.bookmarks : [],
         activity: Array.isArray(p.activity) ? p.activity : [],
@@ -1231,10 +1408,14 @@ async function handleAction(a, data) {
     case 'endReview': ui.review = null; return go('home');
     case 'testKey':
       try {
-        await withBusy('Testing the connection...', () => callAI('Reply with exactly this JSON: {"ok": true}'));
-        ui.message = { type: 'ok', text: 'Connected. The AI answered.' };
+        const res = await withBusy('Testing the connection...', testAllKeys);
+        const bad = res.filter(r => !r.ok);
+        ui.message = bad.length
+          ? { type: 'error', text: res.map(r => r.text).join('. ') + '.' }
+          : { type: 'ok', text: res.length === 1 ? 'Connected. The AI answered.' : 'Connected. All ' + res.length + ' keys work.' };
       } catch (e) { setError(e); }
       return render();
+    case 'clearRest': state.settings.keyStatus = {}; saveState(); return render();
     case 'exportData': return exportData();
     case 'eraseAll':
       if (window.confirm('Erase ALL courses, review questions and settings from this browser?')) {
