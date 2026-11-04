@@ -51,7 +51,8 @@ function defaultState() {
     courses: [],
     cards: [],
     bookmarks: [],
-    activity: []   // days (YYYY-MM-DD) when you learned something; drives your streak
+    activity: [],     // days (YYYY-MM-DD) when you learned something; drives your streak
+    completions: []   // time of day (minutes after midnight) when you finished lessons; used by "best spacing" reminders
   };
 }
 
@@ -68,7 +69,8 @@ function loadState() {
       courses: Array.isArray(p.courses) ? p.courses : [],
       cards: Array.isArray(p.cards) ? p.cards : [],
       bookmarks: Array.isArray(p.bookmarks) ? p.bookmarks : [],
-      activity: Array.isArray(p.activity) ? p.activity : []
+      activity: Array.isArray(p.activity) ? p.activity : [],
+      completions: Array.isArray(p.completions) ? p.completions : []
     };
   } catch (e) {
     return defaultState();
@@ -97,6 +99,7 @@ function saveState() {
   } catch (e) {
     ui.message = { type: 'error', text: 'Could not save to this browser. Storage may be full or blocked (private browsing?).' };
   }
+  if (typeof scheduleSync === 'function') scheduleSync();   // tell the reminder server, if you set one up (notify.js)
 }
 
 /* ================= 2. Helpers ================= */
@@ -876,6 +879,7 @@ function viewSettings() {
   h += '<h2>Teaching methods</h2><p class="muted">Switch any combination on or off. Applies to lessons created from now on (use Regenerate on a lesson\'s last page to redo it).</p>';
   Object.keys(METHOD_INFO).forEach(k => { h += chk(k, METHOD_INFO[k].label, METHOD_INFO[k].help, 'method'); });
   h += '<h2>Schedule</h2>' + chk('allowAhead', 'Let me work ahead', 'Open upcoming lessons early instead of waiting for their date.', 'setting');
+  if (typeof notifySettingsHtml === 'function') h += notifySettingsHtml();
   h += '<h2>Accessibility</h2>' +
     sel('theme', 'Color theme', [['auto', 'Match my device'], ['light', 'Light'], ['dark', 'Dark'], ['contrast', 'High contrast']]) +
     '<label class="field" for="s-fontScale">Text size</label><input type="range" id="s-fontScale" data-setting="fontScale" min="0.85" max="2" step="0.05" value="' + s.fontScale + '">' +
@@ -1006,6 +1010,8 @@ function completeLesson() {
   lesson.completedOn = todayStr();
   lesson.lastPage = 0;
   markActive();
+  const now = new Date();
+  state.completions = (state.completions || []).concat([now.getHours() * 60 + now.getMinutes()]).slice(-30);
   saveState();
 }
 
@@ -1161,7 +1167,8 @@ function importData(file) {
         settings: Object.assign({}, d.settings, p.settings, { methods: Object.assign({}, d.settings.methods, (p.settings && p.settings.methods) || {}), apiKey: key }),
         courses: p.courses, cards: p.cards,
         bookmarks: Array.isArray(p.bookmarks) ? p.bookmarks : [],
-        activity: Array.isArray(p.activity) ? p.activity : []
+        activity: Array.isArray(p.activity) ? p.activity : [],
+        completions: Array.isArray(p.completions) ? p.completions : []
       };
       saveState(); ui.message = { type: 'ok', text: 'Backup restored.' };
     } catch (e) { ui.message = { type: 'error', text: 'That file is not a valid backup.' }; }

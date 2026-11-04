@@ -52,6 +52,16 @@ device and it stays in that browser.
 2. In GitHub Desktop type a short summary, click Commit to main, then Push origin.
 3. Wait a minute or two, then fully close and reopen the app.
 
+## Reminders and widget (optional, free)
+
+The app can send reminders that get harsher the longer you ignore a lesson,
+and show a character widget on your Home Screen. This needs a small free
+server on Cloudflare and the free Scriptable app. Follow SETUP-REMINDERS.md.
+
+Files in this folder: index.html, app.js, notify.js, style.css, sw.js,
+widget.js, manifest.json, icon.png (the app), cloudflare-worker.js and
+SETUP-REMINDERS.md (setup helpers), README.md (this file).
+
 ## Try it on your PC first (optional)
 
 Open a terminal in this folder and run:

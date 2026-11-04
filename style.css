@@ -232,3 +232,8 @@ details.lesson-stat > summary { cursor: pointer; padding: .6rem 0; min-height: 2
 .pct { font-weight: 700; }
 .ls-title { flex: 1 1 10rem; text-align: left; }
 details.course-stat > summary { display: block; }
+
+/* ---------- v3: reminders ---------- */
+.linklike { background: none; border: 0; padding: 0; color: var(--accent); text-decoration: underline; cursor: pointer; font: inherit; min-height: 2rem; }
+input[type="time"] { min-height: 2.75rem; padding: .4rem .6rem; border: 2px solid var(--border); border-radius: .5rem; background: var(--bg); color: var(--fg); }
+details.course-stat textarea { margin-bottom: .4rem; }
